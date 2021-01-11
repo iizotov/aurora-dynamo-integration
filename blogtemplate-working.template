@@ -1,0 +1,693 @@
+AWSTemplateFormatVersion: 2010-09-09
+Outputs:
+  DynamoDBTableConsoleLink:
+    Description: DynamoDB Table Items - Console Link
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/dynamodb/home?region=${AWS::Region}#tables:selected=${DynamoDBTable};tab=items'
+  LambdaConsoleLink:
+    Description: Aurora to DynamoDB Sync Lambda - Console Link
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${DynamoDBLambda}?tab=configuration'
+  AuroraEndpointAddress:
+    Description: Aurora Endpoint Address
+    Value: !GetAtt AuroraPostgresCluster.Endpoint.Address
+  AuroraEndpointPort:
+    Description: Aurora Endpoint Port
+    Value: !GetAtt AuroraPostgresCluster.Endpoint.Port
+  AuroraUser:
+    Description: Aurora database account account
+    Value: !Ref DBADMIN
+  PGAdminURL:
+    Description: URL to access PGAdmin
+    Value: !Sub 'http://${BootstrapEC2Instance.PublicIp}:80/'
+  EC2InstanceConnectURI:
+    Description: URI to SSH into the jumpbox using EC2 Instance Connect
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/ec2/v2/connect/ec2-user/${BootstrapEC2Instance}'
+  
+Parameters:
+  DBADMIN:
+    Description: Aurora db admin account
+    Type: String
+    Default: 'dbadmin'
+    ConstraintDescription: '[A-Za-z]+'
+    MaxLength: 16
+    MinLength: 6
+  DBPWD:
+    Description: Aurora alphanumeric password (default value - Passw0rd)
+    Type: String
+    Default: 'Passw0rd'
+    ConstraintDescription: '[A-Za-z0-9]+'
+    MaxLength: 16
+    MinLength: 6
+    NoEcho: true
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  EnvironmentName:
+    Description: An environment name that is prefixed to resource names
+    Type: String
+    Default: 'aurora-demo'
+
+  VpcCIDR:
+    Description: Please enter the IP range (CIDR notation) for this VPC
+    Type: String
+    Default: 10.192.0.0/16
+
+  PublicSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+    Type: String
+    Default: 10.192.10.0/24
+
+  PublicSubnet2CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the second Availability Zone
+    Type: String
+    Default: 10.192.11.0/24
+
+  PrivateSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the first Availability Zone
+    Type: String
+    Default: 10.192.20.0/24
+
+  PrivateSubnet2CIDR:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the second Availability Zone
+    Type: String
+    Default: 10.192.21.0/24
+
+  AuroraDBInstanceClassParameter:
+    Type: String
+    Default: db.t3.medium
+    AllowedValues:
+      - db.t3.medium
+      - db.t3.large
+      - db.t3.xlarge
+      - db.t3.2xlarge
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+      - db.r5.8xlarge
+      - db.r5.16xlarge
+      - db.r5.24xlarge
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+      - db.r6g.4xlarge
+      - db.r6g.12xlarge
+      - db.r6g.16xlarge
+    Description: Aurora Instance Class
+  AuroraEngineVersionParameter:
+    Type: String
+    Default: 11.9
+    AllowedValues:
+      - 11.9
+    Description: Aurora Engine Version
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet (AZ1)
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet (AZ2)
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs  '' ]
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Subnet (AZ1)
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Subnet (AZ2)
+
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Routes
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Routes (AZ1)
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Routes (AZ2)
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  NoIngressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group with no ingress rule"
+      VpcId: !Ref VPC
+  
+  AuroraDBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for Amazon Aurora"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          SourceSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
+          FromPort: 5432
+          ToPort: 5432
+        - IpProtocol: tcp
+          SourceSecurityGroupId: !GetAtt PGAdminSecurityGroup.GroupId
+          FromPort: 5432
+          ToPort: 5432
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for Lambda"
+      VpcId: !Ref VPC   
+
+  PGAdminSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for PGAdmin"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+          FromPort: 80
+          ToPort: 80
+        - IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+          FromPort: 22
+          ToPort: 22
+
+  AuroraSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      SecretString: !Sub '{"username": "${DBADMIN}", "password": "${DBPWD}"}'
+      Description: Aurora Secret
+  AuroraPostgresInstance1:
+    Type: 'AWS::RDS::DBInstance'
+    DeletionPolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Ref AuroraPostgresCluster
+      DBInstanceClass: !Ref AuroraDBInstanceClassParameter
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+  AuroraPostgresInstance2:
+    Type: 'AWS::RDS::DBInstance'
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceClass: !Ref AuroraDBInstanceClassParameter
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      DBClusterIdentifier: !Ref AuroraPostgresCluster
+  AuroraSecretAttachment:
+    Type: 'AWS::SecretsManager::SecretTargetAttachment'
+    Properties:
+      SecretId: !Ref AuroraSecret
+      TargetId: !Ref AuroraPostgresCluster
+      TargetType: 'AWS::RDS::DBCluster'
+  AuroraDBSubnetGroup: 
+    Properties: 
+      DBSubnetGroupDescription: Aurora Demo Subnet Group
+      SubnetIds: 
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Aurora Subnet Group
+    Type: "AWS::RDS::DBSubnetGroup"
+  
+  AuroraPostgresCluster:
+    Type: 'AWS::RDS::DBCluster'
+    DeletionPolicy: Delete
+    Properties:
+      DBSubnetGroupName: !Ref AuroraDBSubnetGroup
+      VpcSecurityGroupIds: 
+        - !Ref AuroraDBSecurityGroup
+      EnableIAMDatabaseAuthentication: true
+      Engine: aurora-postgresql
+      EngineVersion: !Ref AuroraEngineVersionParameter
+      Port: 5432
+      StorageEncrypted: true
+      MasterUsername: !Sub '{{resolve:secretsmanager:${AuroraSecret}::username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${AuroraSecret}::password}}'
+      AssociatedRoles: 
+        - FeatureName: Lambda
+          RoleArn: !GetAtt AuroraLambdaInvokeRole.Arn
+  AuroraLambdaInvokeRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - rds.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: AuroraLambdaInvokePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: '*'
+                # Resource: !GetAtt 
+                #   - DynamoDBLambda
+                #   - Arn
+  DynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: 'N'
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+        - AttributeName: created_at
+          KeyType: RANGE
+  DynamoDBEndpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      RouteTableIds:
+        - !Ref PublicRouteTable
+        - !Ref PrivateRouteTable1
+        - !Ref PrivateRouteTable2
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcId: !Ref VPC
+  BootstrapEC2InstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: AuroraSecretAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:        
+              - Effect: Allow
+                Action: 'secretsmanager:GetSecretValue'
+                Resource: !Ref AuroraSecret
+        - PolicyName: AuroraAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:        
+              - Effect: Allow
+                Action: 'rds-db:connect'
+                Resource: !Sub 'arn:aws:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${AuroraPostgresCluster}/${DBADMIN}'
+
+  DynamoDBLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: LambdaDLQPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 'sqs:SendMessage'
+                Resource: !GetAtt DynamoDBLambdaDLQ.Arn
+        - PolicyName: DynamoDBTableAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:        
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:BatchWriteItem'
+                  - 'dynamodb:ConditionCheckItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:DescribeTable'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:UpdateItem'
+                Resource: !GetAtt DynamoDBTable.Arn
+  DynamoDBLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Role: !GetAtt DynamoDBLambdaExecutionRole.Arn
+      Runtime: python3.8
+      Handler: index.handler
+      Timeout: 900
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt LambdaSecurityGroup.GroupId
+        SubnetIds:
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+      Environment:
+        Variables:
+          ddbtablename: !Ref DynamoDBTable
+      DeadLetterConfig:
+        TargetArn: !GetAtt DynamoDBLambdaDLQ.Arn
+      Code:
+        ZipFile: |
+          import json, boto3, os
+          from collections import defaultdict
+          from xml.etree import cElementTree as ET
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['ddbtablename'])
+
+          def handler(event, context):
+              new_row = event['f1']
+              old_row = event['f2']
+              operation = event['f3'].lower()
+              if operation in ['insert', 'update']:
+                  xml_new_row = ET.fromstring(new_row['order_data'])
+                  json_new_row = xml_to_json(xml_new_row)
+                  result = table.put_item(
+                      Item=dict(
+                          {'id': int(new_row['id']),
+                          'created_at': new_row['created_at']},
+                          'order_status': new_row['order_status']},
+                          **json_new_row)
+                  )
+                  return {'Status': result['ResponseMetadata']['HTTPStatusCode'], 'Operation': operation, 'rows_affected': 1,
+                          'id': new_row['id'], 'created_at': new_row['created_at']}
+              elif operation == 'delete':
+                  result = table.delete_item(
+                      Key={
+                          'id': int(old_row['id']),
+                          'created_at': old_row['created_at']
+                      })
+                  return {'Status': result['ResponseMetadata']['HTTPStatusCode'], 'Operation': operation, 'rows_affected': 1,
+                          'id': old_row['id'], 'created_at': old_row['created_at']}
+              elif operation == 'truncate':
+                  deleted_rows = truncate_table(table)
+                  return {'Status': 200, 'Operation': operation, 'rows_affected': deleted_rows}
+              else:
+                  raise ValueError(f'Operation {operation} is unknown')
+
+
+          def xml_to_json(t):
+              d = {t.tag: {} if t.attrib else None}
+              children = list(t)
+              if children:
+                  dd = defaultdict(list)
+                  for dc in map(xml_to_json, children):
+                      for k, v in dc.items():
+                          dd[k].append(v)
+                  d = {t.tag: {k: v[0] if len(v) == 1 else v for k, v in dd.items()}}
+              if t.attrib:
+                  d[t.tag].update(('@' + k, v) for k, v in t.attrib.items())
+              if t.text:
+                  text = t.text.strip()
+                  if children or t.attrib:
+                      if text:
+                          d[t.tag]['#text'] = text
+                  else:
+                      d[t.tag] = text
+              return d
+
+          def truncate_table(table):
+              # get the table keys
+              tableKeyNames = [key.get("AttributeName") for key in table.key_schema]
+
+              # Only retrieve the keys for each item in the table (minimize data transfer)
+              projectionExpression = ", ".join('#' + key for key in tableKeyNames)
+              expressionAttrNames = {'#'+key: key for key in tableKeyNames}
+
+              counter = 0
+              page = table.scan(ProjectionExpression=projectionExpression,
+                                ExpressionAttributeNames=expressionAttrNames)
+              with table.batch_writer() as batch:
+                  while page["Count"] > 0:
+                      counter += page["Count"]
+                      for itemKeys in page["Items"]:
+                          batch.delete_item(Key=itemKeys)
+                      if 'LastEvaluatedKey' in page:
+                          page = table.scan(
+                              ProjectionExpression=projectionExpression, ExpressionAttributeNames=expressionAttrNames,
+                              ExclusiveStartKey=page['LastEvaluatedKey'])
+                      else:
+                          break
+              return counter
+
+
+  DynamoDBLambdaDLQ:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      KmsMasterKeyId: alias/aws/sqs
+      MessageRetentionPeriod: 1209600
+  BootstrapEC2InstanceInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Roles: 
+        - !Ref BootstrapEC2InstanceRole
+  BootstrapEC2Instance: 
+    UpdateReplacePolicy: Delete
+    DependsOn:
+      - AuroraPostgresInstance1
+      - AuroraPostgresInstance2
+    Type: AWS::EC2::Instance
+    Properties:
+      # KeyName: igizotov-keypair
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.small
+      IamInstanceProfile: !Ref BootstrapEC2InstanceInstanceProfile
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet: 
+            - Ref: "PGAdminSecurityGroup"
+          SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Bootstrap and PGAdmin Instance
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y
+          sudo amazon-linux-extras enable postgresql11
+          sudo yum install -y socat jq postgresql postgresql-devel virtualenv python3-pip libpq-dev python3-dev
+          
+          T=$(aws secretsmanager get-secret-value --secret-id ${AuroraSecret} --region ${AWS::Region} --query SecretString --output text)
+
+          echo export AURORASECRET=${AuroraSecret} | sudo tee -a /etc/profile
+          echo export DYNAMODBLAMBDAARN=${DynamoDBLambda.Arn} | sudo tee -a /etc/profile
+          echo export PGPORT=$(echo $T | jq '.port') | sudo tee -a /etc/profile
+          echo export PGHOST=$(echo $T | jq '.host') | sudo tee -a /etc/profile
+          echo export PGUSER=$(echo $T | jq '.username') | sudo tee -a /etc/profile
+          echo export PGPASSWORD=$(echo $T | jq '.password') | sudo tee -a /etc/profile
+          echo export PGDATABASE=postgres | sudo tee -a /etc/profile
+          source /etc/profile
+          
+          echo '{"Servers":{"1":{"Name":"Aurora Instance","Group":"Servers","Port":5432,"Username":"'$PGUSER'","Host":"'$PGHOST'","SSLMode":"prefer","MaintenanceDB":"postgres"}}}' > /tmp/servers.json        
+
+          tee /tmp/bootstrap.sql << EOF
+          CREATE EXTENSION IF NOT EXISTS aws_lambda CASCADE;
+          CREATE TABLE IF NOT EXISTS orders
+          (
+              id BIGSERIAL PRIMARY KEY, 
+              created_at timestamp without time zone DEFAULT now(),
+              order_data xml NOT NULL,
+              order_status varchar(32) NOT NULL
+          );
+          CREATE OR REPLACE FUNCTION sync_to_dynamodb() RETURNS trigger AS \$body\$
+          BEGIN
+            PERFORM * FROM aws_lambda.invoke(
+          aws_commons.create_lambda_function_arn('$DYNAMODBLAMBDAARN'),
+          row_to_json(ROW(NEW, OLD, TG_OP)),'Event');
+              RETURN NEW;
+            END;
+          \$body\$ LANGUAGE plpgsql;
+
+          CREATE TRIGGER sync_insert_update_delete_to_dynamodb
+          AFTER INSERT OR UPDATE OR DELETE ON orders
+          FOR EACH ROW EXECUTE PROCEDURE sync_to_dynamodb();
+
+          CREATE TRIGGER sync_truncate_to_dynamodb
+          AFTER TRUNCATE ON orders
+          FOR EACH STATEMENT EXECUTE PROCEDURE sync_to_dynamodb();
+          EOF
+          psql -f /tmp/bootstrap.sql
+          
+          sudo pip3 install virtualenv
+          cd /home/ec2-user/
+          virtualenv pgadmin4
+          cd /home/ec2-user/pgadmin4/
+          source bin/activate
+          P=$(python3 -c "print('python{}'.format(__import__('sys').version[:3]))")
+
+          pip3 install https://ftp.postgresql.org/pub/pgadmin/pgadmin4/v4.29/pip/pgadmin4-4.29-py3-none-any.whl
+          cd pgadmin4
+
+          tee lib/$P/site-packages/pgadmin4/config_local.py << EOF
+          import os
+          DATA_DIR = os.path.realpath(os.path.expanduser(u'/home/ec2-user/.pgadmin/'))
+          LOG_FILE = os.path.join(DATA_DIR, 'pgadmin4.log')
+          SQLITE_PATH = os.path.join(DATA_DIR, 'pgadmin4.db')
+          SESSION_DB_PATH = os.path.join(DATA_DIR, 'sessions')
+          STORAGE_DIR = os.path.join(DATA_DIR, 'storage')
+          SERVER_MODE = False
+          MASTER_PASSWORD_REQUIRED = False
+          DEFAULT_SERVER_PORT = 5050
+          DEFAULT_SERVER = '127.0.0.1'
+          EOF
+
+          python3 lib/$P/site-packages/pgadmin4/setup.py --sqlite-path /home/ec2-user/.pgadmin/pgadmin4.db
+          python3 lib/$P/site-packages/pgadmin4/setup.py --load-servers /tmp/servers.json --sqlite-path /home/ec2-user/.pgadmin/pgadmin4.db
+          
+          nohup python3 lib/$P/site-packages/pgadmin4/pgAdmin4.py &
+          sudo nohup socat TCP-LISTEN:80,fork TCP:127.0.0.1:5050 &
+
+          tee -a /etc/rc.local << EOF
+          cd /home/ec2-user/pgadmin4/
+          source bin/activate
+          P=$(python3 -c "print('python{}'.format(__import__('sys').version[:3]))")
+          python3 lib/$P/site-packages/pgadmin4/setup.py --sqlite-path /home/ec2-user/.pgadmin/pgadmin4.db
+          python3 lib/$P/site-packages/pgadmin4/setup.py --load-servers /tmp/servers.json --sqlite-path /home/ec2-user/.pgadmin/pgadmin4.db
+          
+          EOF
+          chmod +x /etc/rc.local
